@@ -1,0 +1,10 @@
+[Unit]
+Description=Backup files as configured in /etc/rsync-backup
+
+[Timer]
+OnCalendar=*-*-* 6:00
+Persistent=true
+# Unit=rsync-backup.service
+
+[Install]
+WantedBy=timers.target

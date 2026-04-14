@@ -1,0 +1,6 @@
+[Unit]
+Description=Backup files as configured in /etc/rsync-backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rsync-backup

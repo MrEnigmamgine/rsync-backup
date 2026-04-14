@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###################################################################
+## Snapshot-style rsync backup with rotation and logging
+## /usr/local/bin/rsync-backup.sh
+###################################################################
+
+# This is a heavily modified version of the script from the article below:
+# https://kx.cloudingenium.com/rsync-backup-strategies-linux-servers
+
+# TODO: Handle symlink to latest over ssh when pushing
+# TODO: Handle cleanup when pushing to remote
+# TODO: Add more sophisticated backup retention (e.g. keep x daily, y weekly, and z monthly)
+
+usage() {
+    echo "Usage: $0 [options]"
+    echo "Options:"
+    echo "  -c, --config-dir DIR   Use specified config directory (default: /etc/rsync-backup)"
+    echo "  -j, --job NAME         Use config from /etc/rsync-backup/NAME/config.conf"
+    echo "  -h, --help             Show this help message and exit"
+    echo "  --dry-run              Perform a trial run with no changes made"
+    echo "  --restore              Restore from latest backup instead of creating a new one (not implemented yet)"
+    echo ""
+    echo "All other arguments will be passed as additional options to rsync (e.g. --delete, --progress, etc.)"
+    exit 1
+}
+
+# ─── Default Configuration ───────────────────────────────────────
+LOG_DIR="/var/log/rsync-backup"
+RETENTION_DAYS=30
+BWLIMIT=0  # 0 = unlimited, or set KB/s
+USE_INCLUDE_FILE=1
+USE_EXCLUDE_FILE=1
+USE_FROM_FILE=1
+USE_FILTER_FILE=1
+USE_PER_DIR_FILTERS=1
+USE_SSH=0
+IS_DRY_RUN=0
+
+
+# ─── Parse Command Line Arguments ─────────────────────────────────
+
+# If called without arguments set default config directory.
+if [[ $# -eq 0 ]]; then
+    CONFIG_DIR="/etc/rsync-backup"
+fi
+
+
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        # Specify a directory outside of the normal structure.
+        -c | --config-dir)
+            CONFIG_DIR="$2"
+            shift 2
+            ;;
+        
+        -j | --job)
+            if [[ "$2" == "default" ]]; then
+                CONFIG_DIR="/etc/rsync-backup"
+            else
+                CONFIG_DIR="/etc/rsync-backup/${2}"
+            fi
+            shift 2
+            ;;
+        --restore)
+            RESTORE_FLAG=1
+            shift
+            echo "Restore functionality not implemented yet."
+            exit 1 # [TODO]
+            ;;
+        --dry-run)
+            IS_DRY_RUN=1
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1") # We'll pass everything else directly to rsync.
+            shift
+            ;;
+    esac
+done
+
+# Check for required config file
+if [ -s ${CONFIG_DIR}/config.conf ]; then
+    source ${CONFIG_DIR}/config.conf
+else
+    echo "Error: Config file not found or is empty: ${CONFIG_DIR}/config.conf"
+    exit 1
+fi
+
+# ─── Derived Variables ───────────────────────────────────────────
+DATE=$(date +%Y-%m-%d_%H-%M-%S)
+DEST="${DEST_ROOT}/${DATE}"
+LATEST="${DEST_ROOT}/latest"
+LOG_FILE="${LOG_DIR}/backup-${DATE}.log"
+LOCK_FILE="/tmp/rsync-backup.lock"
+
+
+# ─── Functions ───────────────────────────────────────────────────
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+cleanup() {
+    rm -f "$LOCK_FILE"
+    log "Lock file removed."
+}
+
+is_true() {
+    # Handles common ways to represent "true" in config files (case-insensitive)
+    case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+        true|on|1|yes|y) return 0 ;;  # 0 is "Success/True" in exit codes
+        *)               return 1 ;;  # Everything else is false
+    esac
+}
+
+# ─── Build rsync options ──────────────────────────────────────────
+RSYNC_OPTS=(
+    -ah
+    --mkpath
+    --numeric-ids
+    --log-file="$LOG_FILE"
+    --link-dest="$LATEST"
+)
+
+RSYNC_OPTS+=("${POSITIONAL_ARGS[@]}") # Add any extra args passed on the command line
+
+# Skip hard-linking on the first run.
+# [ -L "$LATEST" ] && RSYNC_OPTS+=(--link-dest="$LATEST")
+
+# Honor dry-run in rsync if enabled.
+if is_true "$IS_DRY_RUN"; then
+    RSYNC_OPTS+=(-n)
+fi
+
+# For each of the optional include/exclude/from files, check if they are enabled.
+# Then check if they are defined in the config, otherwise assume them in the config directory with default names.
+# Then if the file exists, add the appropriate option(s) to the rsync command.
+if is_true "$USE_INCLUDE_FILE"; then
+    if [ -z "${INCLUDE_FILE:-}" ]; then
+        INCLUDE_FILE="${CONFIG_DIR}/include.txt"
+    fi
+    if [ -f "${INCLUDE_FILE}" ]; then
+        RSYNC_OPTS+=(--include-from="$INCLUDE_FILE")
+        log "Using include file: ${INCLUDE_FILE}"
+    fi
+fi
+if is_true "$USE_EXCLUDE_FILE"; then
+    if [ -z "${EXCLUDE_FILE:-}" ]; then
+        EXCLUDE_FILE="${CONFIG_DIR}/exclude.txt"
+    fi
+    if [ -f "${EXCLUDE_FILE}" ]; then
+        RSYNC_OPTS+=(--exclude-from="$EXCLUDE_FILE")
+        log "Using exclude file: ${EXCLUDE_FILE}"
+    fi
+fi
+if is_true "$USE_FROM_FILE"; then
+    if [ -z "${FROM_FILE:-}" ]; then
+        FROM_FILE="${CONFIG_DIR}/from.txt"
+    fi
+    if [ -f "${FROM_FILE}" ]; then
+        RSYNC_OPTS+=(--files-from="$FROM_FILE")
+        RSYNC_OPTS+=(-r) # --files-from removes the -r implied by -a, so we add it back.
+        log "Using from file: ${FROM_FILE}"
+    fi
+fi
+
+[ "$BWLIMIT" -gt 0 ] 2>/dev/null && RSYNC_OPTS+=(--bwlimit="$BWLIMIT")
+
+# Honor settings in .rsync-filter if it exists for each directory
+if is_true "$USE_PER_DIR_FILTERS"; then
+    RSYNC_OPTS+=(-F)
+fi
+
+
+# ─── SSH Options ─────────────────────────────────────────────────
+if is_true "$USE_SSH"; then
+    SSH_OPTS=()
+    [ -n "${SSH_PORT:-}" ] && SSH_OPTS+=(-p "$SSH_PORT")
+    [ -n "${SSH_KEY:-}" ] && SSH_OPTS+=(-i "$SSH_KEY")
+    RSYNC_OPTS+=( -e "ssh ${SSH_OPTS[*]}" )
+
+    # Appropriately prepend the SSH path to source or destination.
+    if is_true "${SSH_HOST_IS_SOURCE:-}"; then
+        SOURCE="${SSH_USER}@${SSH_HOST}:${SOURCE}"
+    else
+        DEST="${SSH_USER}@${SSH_HOST}:${DEST}"
+        LATEST="${SSH_USER}@${SSH_HOST}:${LATEST}"
+    fi
+fi
+
+# ─── Pre-flight Checks ──────────────────────────────────────────
+
+mkdir -p "$LOG_DIR"
+
+# Prevent concurrent runs
+while [ -f "$LOCK_FILE" ]; do
+    log "Lock file ${LOCK_FILE} exists. Waiting..."
+    sleep 5
+done
+
+trap cleanup EXIT
+touch "$LOCK_FILE"
+
+log "=== Backup started ==="
+log "Source: $SOURCE"
+log "Destination: $DEST"
+
+
+# ─── Run rsync ───────────────────────────────────────────────────
+log " --- Executing rsync --- "
+if rsync "${RSYNC_OPTS[@]}" "$SOURCE" "$DEST/"; then
+    log "rsync completed successfully."
+else
+    RSYNC_EXIT=$?
+    log "ERROR: rsync exited with code $RSYNC_EXIT"
+    # Send alert (uncomment and configure)
+    # mail -s "Backup FAILED" admin@example.com
+    exit $RSYNC_EXIT
+fi
+
+# ─── Update latest symlink ──────────────────────────────────────
+if is_true "$IS_DRY_RUN"; then
+    log "Dry run enabled, no changes were made."
+    exit 0
+else
+    if (! is_true "${USE_SSH:-}") || (is_true "${SSH_HOST_IS_SOURCE:-}"); then
+        rm -f "$LATEST"
+        ln -s "$DEST" "$LATEST"
+        log "Updated 'latest' symlink to $DEST"
+    else
+        # Update the 'latest' symlink on the remote server via SSH
+        DEST="${DEST#*:}"  # Remove "user@host:" prefix if present
+        LATEST="${LATEST#*:}"  # Remove "user@host:" prefix if present
+        SSH_SYMLINK_CMD="rm -f $LATEST && ln -s $DEST $LATEST"
+        if ssh "${SSH_OPTS[@]}" "${SSH_USER}@${SSH_HOST}" "$SSH_SYMLINK_CMD"; then
+            log "Updated 'latest' symlink on remote server to $DEST"
+        else
+            log "ERROR: Failed to update 'latest' symlink on remote server"
+            exit 1
+        fi
+    fi
+fi
+
+
+# ─── Rotate old backups ─────────────────────────────────────────
+
+if (! is_true "${USE_SSH:-}") || (is_true "${SSH_HOST_IS_SOURCE:-}"); then
+    log "Removing backups older than $RETENTION_DAYS days..."
+    find "$DEST_ROOT" -maxdepth 1 -type d -name "20*" -mtime +$RETENTION_DAYS -exec rm -rf {} \;
+else
+    log "Removing backups older than $RETENTION_DAYS days via SSH..."
+    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${SSH_HOST}" \
+    "find $DEST_ROOT -maxdepth 1 -type d -name '20*' -mtime +$RETENTION_DAYS -exec rm -rf {} \;"
+fi
+
+
+# ─── Disk usage report ──────────────────────────────────────────
+if (! is_true "${USE_SSH:-}") || (is_true "${SSH_HOST_IS_SOURCE:-}"); then
+    USAGE=$(du -sh "$DEST_ROOT" | cut -f1)
+    log "Total backup storage used: $USAGE"
+fi
+
+log "=== Backup finished ==="

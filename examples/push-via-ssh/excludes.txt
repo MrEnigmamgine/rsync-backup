@@ -1,0 +1,50 @@
+# Binaries and libraries
+/bin/
+/usr/bin/
+/lib/
+/usr/lib/
+/lib64/
+/usr/lib64/
+
+# Include /var/lib while ignoring most of var
++ /var/lib/
+/var/
+
+# BTRFS snapshots
+/.snapshots/
+
+# Temporary and cache files
+*.tmp
+*.swp
+*.swo
+*~
+
+# Junk directries
+.cache/
+.thumbnails/
+.var/
+.local/share/
+.local/state/
+
+# Build artifacts
+node_modules/
+vendor/
+__pycache__/
+*.pyc
+target/
+build/
+dist/
+
+# System files that should not be backed up
+/proc/
+/sys/
+/dev/
+/run/
+/tmp/
+/mnt/
+/media/
+/lost+found/
+
+# Large media files (optional)
+*.iso
+*.mp4
