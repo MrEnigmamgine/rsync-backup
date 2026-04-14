@@ -9,8 +9,8 @@ set -euo pipefail
 # This is a heavily modified version of the script from the article below:
 # https://kx.cloudingenium.com/rsync-backup-strategies-linux-servers
 
-# TODO: Handle symlink to latest over ssh when pushing
-# TODO: Handle cleanup when pushing to remote
+
+# TODO: Work out how to handle --restore
 # TODO: Add more sophisticated backup retention (e.g. keep x daily, y weekly, and z monthly)
 
 usage() {
